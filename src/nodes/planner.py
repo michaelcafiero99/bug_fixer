@@ -36,6 +36,14 @@ class Plan(BaseModel):
 _SKIP_DIRS = {".git", "__pycache__", "node_modules", ".venv", "venv", ".mypy_cache"}
 
 
+class _TokenCounter:
+    """Minimal shim satisfying aider's RepoMap.main_model interface."""
+
+    def token_count(self, text: str) -> int:
+        # ~4 chars per token is a good enough approximation for budget purposes
+        return len(text) // 4
+
+
 def _repo_map(repo_path: str) -> str:
     """Build an aider RepoMap; fall back to ls -R if aider is unavailable."""
     try:
@@ -43,7 +51,7 @@ def _repo_map(repo_path: str) -> str:
         from aider.io import InputOutput
 
         io = InputOutput(pretty=False, yes=True)
-        rm = RepoMap(root=repo_path, io=io, map_tokens=2048)
+        rm = RepoMap(root=repo_path, io=io, main_model=_TokenCounter(), map_tokens=2048)
 
         all_files: list[str] = []
         for dirpath, dirs, filenames in os.walk(repo_path):
@@ -98,12 +106,21 @@ def planner_node(state: dict) -> dict:
     repo_url = state.get("repo_url", "")
 
     repo_context = _get_repo_structure(repo_url) if repo_url else "(no repo URL provided)"
-    logger.info("Repo map (%d chars):\n%s", len(repo_context), repo_context[:1000])
+    logger.info(
+        "── Repo map (%d chars) ──────────────────────────────\n%s\n── end repo map ──",
+        len(repo_context),
+        repo_context,
+    )
 
+    logger.info("── Calling Gemini planner ───────────────────────────")
     result: Plan = _chain.invoke({
         "input": f"Issue / task:\n{issue_desc}\n\nRepository map:\n{repo_context}",
     })
 
     plan = [step.model_dump() for step in result.steps]
-    logger.info("Planner produced %d step(s): %s", len(plan), [s["file"] for s in plan])
+    logger.info(
+        "── Planner output (%d step(s)) ──────────────────────\n%s\n── end plan ──",
+        len(plan),
+        "\n".join(f"  {i+1}. [{s['file']}] {s['description']}" for i, s in enumerate(plan)),
+    )
     return {"plan": plan, "retries": 0, "status": "executing"}

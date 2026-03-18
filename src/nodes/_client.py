@@ -10,7 +10,7 @@ from langchain_google_genai import ChatGoogleGenerativeAI
 
 load_dotenv()
 
-MODEL = "gemini-2.0-flash"
+MODEL = "gemini-2.5-flash"
 
 llm = ChatGoogleGenerativeAI(
     model=MODEL,

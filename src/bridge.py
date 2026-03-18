@@ -20,10 +20,14 @@ from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
+# force=True replaces any handlers uvicorn already attached to the root logger
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    force=True,
 )
+# Ensure our node loggers are always visible (they run in a thread executor)
+logging.getLogger("nodes").setLevel(logging.INFO)
 logger = logging.getLogger("bridge")
 
 # Lazy import so graph compilation errors surface clearly
@@ -140,7 +144,9 @@ async def github_webhook(request: Request, background_tasks: BackgroundTasks):
             body[:500] + ("..." if len(body) > 500 else ""),
         )
 
-        if action not in ("opened", "edited"):
+        _ACTIONABLE = {"opened", "edited", "reopened"}
+        if action not in _ACTIONABLE:
+            logger.info("Issue action '%s' ignored (not in %s)", action, _ACTIONABLE)
             return {"msg": f"issue action '{action}' ignored"}
 
         task = (
