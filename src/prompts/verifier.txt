@@ -4,16 +4,22 @@ You will receive the original task, the implementation plan, and the results pro
 Each result entry may contain:
 - step: description of what was attempted
 - file: the file that was modified or created
-- explanation: the LLM's summary of the change it made
+- aider_output: stdout from Aider (the AI coding tool that made the change)
 - diff: the actual git diff of changes applied inside the sandbox
 - test_output: stdout/stderr from running the test suite
-- sandbox_error: any error that occurred during sandbox execution (bad sign)
+- sandbox_error: any error that occurred during sandbox execution
 - clone_output: output from cloning the repository
 
-Evaluation criteria:
-- Set complete=true only if ALL of the following hold:
-  1. All plan steps were executed without sandbox_error
-  2. Each step produced a non-empty diff (actual code was changed)
-  3. The test output shows no FAILED or ERROR test results
-- Set complete=false if any step has a sandbox_error, an empty diff, or failing tests.
-- Write a concise one-sentence summary explaining your verdict, referencing specific evidence (e.g. test counts, diff size, errors seen).
+Set complete=true ONLY when ALL of the following hold:
+1. All plan steps executed without sandbox_error
+2. Each step produced a non-empty diff (actual code was changed)
+3. The test output shows no FAILED or ERROR lines
+
+For failure_type, use exactly one of:
+- "none" — task is complete (use when complete=true)
+- "test_failure" — tests ran and reported FAILED/ERROR (the code fix is incorrect)
+- "infra_error" — the test runner could not start: look for "unrecognized arguments", "command not found", "ModuleNotFoundError", "No such file", or similar setup/environment errors in test_output stderr
+- "no_diff" — diff is empty or "(no diff)", meaning no code was actually changed
+- "sandbox_error" — sandbox_error field is present
+
+Write a concise one-sentence summary referencing specific evidence: test pass/fail counts, diff line counts, or the exact error message seen.

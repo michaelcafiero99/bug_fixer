@@ -1,38 +1,14 @@
-"""actor_node — clones the repo into an E2B sandbox, applies one plan step, returns diff + test output."""
+"""actor_node — clones the repo into an E2B sandbox and runs Aider to apply one plan step."""
 
 from __future__ import annotations
 
-import base64
 import logging
+import os
 from typing import Any
 
 from e2b_code_interpreter import Sandbox
-from langchain_core.prompts import ChatPromptTemplate
-from pydantic import BaseModel, Field
-
-from ._client import llm, load_prompt
 
 logger = logging.getLogger("nodes.actor")
-
-_SYSTEM = load_prompt("actor")
-
-
-# ---------------------------------------------------------------------------
-# Structured output schema
-# ---------------------------------------------------------------------------
-
-class FileEdit(BaseModel):
-    new_content: str = Field(description="Complete new content for the target file")
-    explanation: str = Field(description="One-sentence summary of the change made")
-
-
-_chain = (
-    ChatPromptTemplate.from_messages([
-        ("system", _SYSTEM),
-        ("human", "{input}"),
-    ])
-    | llm.with_structured_output(FileEdit)
-)
 
 
 # ---------------------------------------------------------------------------
@@ -55,25 +31,69 @@ def _clone_repo(sbx: Sandbox, repo_url: str) -> str:
     return _stdout(result)
 
 
-def _read_file(sbx: Sandbox, rel_path: str) -> str:
-    """Read /repo/{rel_path} from the sandbox; return empty string if missing."""
-    result = sbx.run_code(
-        f"import pathlib\n"
-        f"p = pathlib.Path('/repo/{rel_path}')\n"
-        f"print(p.read_text() if p.exists() else '')\n"
-    )
-    return _stdout(result)
+def _aider_step(sbx: Sandbox, message: str, target_file: str, api_key: str) -> str:
+    """Find a compatible Python (3.10-3.12), install aider-chat, and run it.
 
-
-def _write_file(sbx: Sandbox, rel_path: str, content: str) -> None:
-    """Write content to /repo/{rel_path} inside the sandbox via base64 to avoid shell escaping."""
-    encoded = base64.b64encode(content.encode()).decode()
-    sbx.run_code(
-        f"import base64, pathlib\n"
-        f"p = pathlib.Path('/repo/{rel_path}')\n"
-        f"p.parent.mkdir(parents=True, exist_ok=True)\n"
-        f"p.write_bytes(base64.b64decode({encoded!r}))\n"
+    Split into two run_code calls so that each gets its own explicit timeout:
+    - Cell 1 (timeout=300s): locate python3.12 and pip-install aider-chat
+    - Cell 2 (timeout=360s): run aider with the given message
+    aider-chat requires Python <3.13; the E2B sandbox ships 3.13.
+    """
+    # ── Cell 1: install ──────────────────────────────────────────────────────
+    install_result = sbx.run_code(
+        "import subprocess, shutil\n"
+        "\n"
+        "py = None\n"
+        "for candidate in ['python3.12', 'python3.11', 'python3.10']:\n"
+        "    if shutil.which(candidate):\n"
+        "        py = candidate\n"
+        "        break\n"
+        "\n"
+        "if py is None:\n"
+        "    subprocess.run(['apt-get', 'install', '-y', '-q', 'python3.12'],\n"
+        "                   capture_output=True, timeout=120)\n"
+        "    py = 'python3.12'\n"
+        "\n"
+        "print('Using Python:', py)\n"
+        "\n"
+        "pip = subprocess.run(\n"
+        "    [py, '-m', 'pip', 'install', '-q', 'aider-chat'],\n"
+        "    capture_output=True, text=True, timeout=240)\n"
+        "if pip.returncode != 0:\n"
+        "    print('pip install FAILED:', pip.stderr[:800])\n"
+        "else:\n"
+        "    print('aider-chat installed ok')\n"
+        "\n"
+        "# Expose py for the next cell via a sentinel file\n"
+        "import pathlib\n"
+        "pathlib.Path('/tmp/aider_py').write_text(py)\n",
+        timeout=300,
     )
+    install_out = _stdout(install_result)
+    logger.info("Aider install: %s", install_out)
+
+    if "FAILED" in install_out:
+        return install_out  # surface the error immediately
+
+    # ── Cell 2: run aider ────────────────────────────────────────────────────
+    extra_file = f", '--file', {target_file!r}" if target_file else ""
+    run_result = sbx.run_code(
+        "import subprocess, os, pathlib\n"
+        f"os.environ['GEMINI_API_KEY'] = {api_key!r}\n"
+        "py = pathlib.Path('/tmp/aider_py').read_text().strip()\n"
+        f"cmd = [py, '-m', 'aider',\n"
+        f"       '--model', 'gemini/gemini-2.5-flash',\n"
+        f"       '--message', {message!r},\n"
+        f"       '--yes-always', '--no-show-model-warnings', '--no-auto-commits'"
+        f"{extra_file}]\n"
+        "r = subprocess.run(cmd, capture_output=True, text=True, cwd='/repo', timeout=300)\n"
+        "print(r.stdout)\n"
+        "if r.stderr:\n"
+        "    print('--- aider stderr ---')\n"
+        "    print(r.stderr[:2000])\n",
+        timeout=360,
+    )
+    return install_out + "\n" + _stdout(run_result)
 
 
 def _git_diff(sbx: Sandbox) -> str:
@@ -124,7 +144,7 @@ def _run_tests(sbx: Sandbox) -> str:
 # ---------------------------------------------------------------------------
 
 def actor_node(state: dict) -> dict:
-    """Clone the repo, apply one plan step, return diff and test results."""
+    """Clone the repo, run Aider to apply one plan step, return diff and test results."""
     plan = state.get("plan", [])
     results = state.get("results", [])
     repo_url = state.get("repo_url", "")
@@ -151,53 +171,31 @@ def actor_node(state: dict) -> dict:
         "file": target_file,
     }
 
+    api_key = os.environ.get("GEMINI_API_KEY", "")
+
     sbx = None
     try:
         sbx = Sandbox.create()
 
-        # ── 1. Clone the repo ──────────────────────────────────────────────
+        # ── 1. Clone ───────────────────────────────────────────────────────
         if repo_url:
             clone_out = _clone_repo(sbx, repo_url)
-            logger.info("Clone output: %s", clone_out.strip())
+            logger.info("Clone: %s", clone_out)
             result["clone_output"] = clone_out
         else:
-            logger.warning("No repo_url in state — skipping clone")
+            logger.warning("No repo_url — skipping clone")
 
-        # ── 2. Read existing file content ──────────────────────────────────
-        existing_content = ""
-        if target_file and repo_url:
-            existing_content = _read_file(sbx, target_file)
-            logger.info(
-                "Read %d chars from %s",
-                len(existing_content), target_file,
-            )
+        # ── 2. Run Aider ───────────────────────────────────────────────────
+        aider_out = _aider_step(sbx, current_step, target_file, api_key)
+        logger.info("Aider output (%d chars):\n%s", len(aider_out), aider_out[:1000])
+        result["aider_output"] = aider_out
 
-        # ── 3. Ask LLM to produce the new file content ────────────────────
-        human_msg = (
-            f"Plan step {step_index + 1}: {current_step}\n\n"
-            f"Target file: {target_file or '(new file)'}\n\n"
-        )
-        if existing_content:
-            human_msg += f"Current file content:\n```\n{existing_content}\n```\n"
-        else:
-            human_msg += "Current file content: (file does not exist yet — create it)\n"
-
-        edit: FileEdit = _chain.invoke({"input": human_msg})
-        result["explanation"] = edit.explanation
-        logger.info("LLM edit explanation: %s", edit.explanation)
-
-        # ── 4. Write the new content back into the sandbox ─────────────────
-        if target_file:
-            _write_file(sbx, target_file, edit.new_content)
-            logger.info("Wrote new content to /repo/%s", target_file)
-            result["new_content"] = edit.new_content
-
-        # ── 5. Capture git diff ────────────────────────────────────────────
+        # ── 3. Capture git diff ────────────────────────────────────────────
         diff = _git_diff(sbx)
         result["diff"] = diff
         logger.info("Git diff (%d chars):\n%s", len(diff), diff[:500])
 
-        # ── 6. Run test suite ──────────────────────────────────────────────
+        # ── 4. Run test suite ──────────────────────────────────────────────
         test_output = _run_tests(sbx)
         result["test_output"] = test_output
         logger.info("Test output (%d chars):\n%s", len(test_output), test_output[:800])

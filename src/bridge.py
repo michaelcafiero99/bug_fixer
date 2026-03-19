@@ -89,8 +89,16 @@ async def _execute_run(
             "issue_desc": issue_desc,
             "repo_url": repo_url,
             "plan": [],
+            # reproduce phase
+            "repro_result": {},
+            "repro_verified": False,
+            "repro_retries": 0,
+            "repro_failure_reason": "",
+            # fix phase
             "results": [],
             "retries": 0,
+            "failure_type": "",
+            # terminal
             "output": "",
             "status": "planning",
         }
