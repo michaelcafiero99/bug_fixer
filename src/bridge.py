@@ -15,27 +15,24 @@ import logging
 import uuid
 from typing import Any
 
+def _make_fix_branch(label: str = "") -> str:
+    """Return a unique branch name like fix/gh-agent-abc12345."""
+    slug = label.lower().replace(" ", "-")[:30].strip("-") if label else ""
+    short = uuid.uuid4().hex[:8]
+    return f"fix/gh-agent-{slug}-{short}" if slug else f"fix/gh-agent-{short}"
+
 import uvicorn
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-# force=True replaces any handlers uvicorn already attached to the root logger
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    force=True,
 )
-# Ensure our node loggers are always visible (they run in a thread executor)
-logging.getLogger("nodes").setLevel(logging.INFO)
 logger = logging.getLogger("bridge")
-
-# Lazy import so graph compilation errors surface clearly
 from graph import graph
 
-# ---------------------------------------------------------------------------
-# App setup
-# ---------------------------------------------------------------------------
 
 app = FastAPI(
     title="SWE Agent Orchestrator",
@@ -53,14 +50,8 @@ app.add_middleware(
 # In-memory run store (replace with Redis / DB for production)
 _runs: dict[str, dict[str, Any]] = {}
 
-
-# ---------------------------------------------------------------------------
-# Request / response models
-# ---------------------------------------------------------------------------
-
 class RunRequest(BaseModel):
     task: str
-
 
 class RunResponse(BaseModel):
     run_id: str
@@ -72,6 +63,7 @@ class StatusResponse(BaseModel):
     status: str  # queued | running | complete | error
     output: str | None = None
     results: list[Any] | None = None
+    pr_url: str | None = None
     error: str | None = None
 
 
@@ -80,7 +72,8 @@ class StatusResponse(BaseModel):
 # ---------------------------------------------------------------------------
 
 async def _execute_run(
-    run_id: str, task: str, issue_desc: str = "", repo_url: str = ""
+    run_id: str, task: str, issue_desc: str = "", repo_url: str = "",
+    fix_branch: str = "",
 ) -> None:
     _runs[run_id]["status"] = "running"
     try:
@@ -89,18 +82,18 @@ async def _execute_run(
             "issue_desc": issue_desc,
             "repo_url": repo_url,
             "plan": [],
-            # reproduce phase
             "repro_result": {},
             "repro_verified": False,
             "repro_retries": 0,
             "repro_failure_reason": "",
-            # fix phase
+            "repro_test": {},
             "results": [],
             "retries": 0,
             "failure_type": "",
-            # terminal
+            "fix_branch": fix_branch,
             "output": "",
             "status": "planning",
+            "pr_url": "",
         }
         # LangGraph invoke is synchronous — run in a thread so we don't block
         loop = asyncio.get_event_loop()
@@ -112,6 +105,7 @@ async def _execute_run(
                 "status": "complete",
                 "output": final_state.get("output", ""),
                 "results": final_state.get("results", []),
+                "pr_url": final_state.get("pr_url", ""),
             }
         )
     except Exception as exc:
@@ -157,22 +151,26 @@ async def github_webhook(request: Request, background_tasks: BackgroundTasks):
             logger.info("Issue action '%s' ignored (not in %s)", action, _ACTIONABLE)
             return {"msg": f"issue action '{action}' ignored"}
 
+        repo_url = payload.get("repository", {}).get("clone_url", "")
         task = (
             f"GitHub issue #{number} was {action} on {repo}.\n"
             f"Title: {title}\n"
             f"Author: {user}\n"
             f"URL: {url}\n\n"
-            f"Issue body:\n{body}\n\n"
-            f"Analyse the issue, suggest a fix or implementation plan, "
-            f"and produce any relevant code or steps."
+            f"Issue body:\n{body}"
         )
 
-        repo_url = payload.get("repository", {}).get("clone_url", "")
         run_id = str(uuid.uuid4())
-        _runs[run_id] = {"status": "queued", "task": task, "repo": repo, "issue": number}
-        background_tasks.add_task(_execute_run, run_id, task, body, repo_url)
-        logger.info("Queued run %s for issue #%s (repo_url=%s)", run_id, number, repo_url)
-        return {"run_id": run_id, "status": "queued", "repo": repo, "issue": number}
+        fix_branch = _make_fix_branch(f"issue-{number}")
+        _runs[run_id] = {"status": "queued", "task": task, "repo": repo, "issue": number,
+                         "fix_branch": fix_branch}
+        background_tasks.add_task(
+            _execute_run, run_id, task, issue_desc=body,
+            repo_url=repo_url, fix_branch=fix_branch,
+        )
+        logger.info("Queued run %s for issue #%s (branch=%s)", run_id, number, fix_branch)
+        return {"run_id": run_id, "status": "queued", "repo": repo, "issue": number,
+                "fix_branch": fix_branch}
 
     # ── Push event ──────────────────────────────────────────────────────────
     if event_type == "push":
@@ -190,10 +188,9 @@ async def github_webhook(request: Request, background_tasks: BackgroundTasks):
             f"and produce a short engineering report."
         )
 
-        repo_url = payload.get("repository", {}).get("clone_url", "")
         run_id = str(uuid.uuid4())
         _runs[run_id] = {"status": "queued", "task": task, "repo": repo, "branch": branch}
-        background_tasks.add_task(_execute_run, run_id, task, "", repo_url)
+        background_tasks.add_task(_execute_run, run_id, task)
         logger.info("Queued run %s for push to %s/%s", run_id, repo, branch)
         return {"run_id": run_id, "status": "queued", "repo": repo, "branch": branch}
 
@@ -205,8 +202,9 @@ async def github_webhook(request: Request, background_tasks: BackgroundTasks):
 async def submit_run(body: RunRequest, background_tasks: BackgroundTasks):
     """Submit a new engineering task to the agent manually."""
     run_id = str(uuid.uuid4())
-    _runs[run_id] = {"status": "queued", "task": body.task}
-    background_tasks.add_task(_execute_run, run_id, body.task)
+    fix_branch = _make_fix_branch()
+    _runs[run_id] = {"status": "queued", "task": body.task, "fix_branch": fix_branch}
+    background_tasks.add_task(_execute_run, run_id, body.task, fix_branch=fix_branch)
     return RunResponse(run_id=run_id)
 
 
@@ -223,10 +221,6 @@ async def get_status(run_id: str):
 async def health():
     return {"status": "ok"}
 
-
-# ---------------------------------------------------------------------------
-# Entry point
-# ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
     uvicorn.run("bridge:app", host="0.0.0.0", port=8000, reload=True)

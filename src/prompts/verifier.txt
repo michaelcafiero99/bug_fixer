@@ -13,12 +13,17 @@ Each result entry may contain:
 Set complete=true ONLY when ALL of the following hold:
 1. All plan steps executed without sandbox_error
 2. Each step produced a non-empty diff (actual code was changed)
-3. The test output shows no FAILED or ERROR lines
+3. The test output contains no FAILED or ERROR lines
+   - "no tests ran" / "collected 0 items" counts as PASSING this condition — it means
+     the repo has no automated tests for this change, which is acceptable for
+     config, build, or tooling fixes. Do NOT classify this as infra_error.
 
 For failure_type, use exactly one of:
 - "none" — task is complete (use when complete=true)
 - "test_failure" — tests ran and reported FAILED/ERROR (the code fix is incorrect)
-- "infra_error" — the test runner could not start: look for "unrecognized arguments", "command not found", "ModuleNotFoundError", "No such file", or similar setup/environment errors in test_output stderr
+- "infra_error" — the test runner could not start: look for "unrecognized arguments",
+  "command not found", "ModuleNotFoundError", "No such file", or similar
+  setup/environment errors. "no tests ran" is NOT an infra_error.
 - "no_diff" — diff is empty or "(no diff)", meaning no code was actually changed
 - "sandbox_error" — sandbox_error field is present
 
