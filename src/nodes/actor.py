@@ -173,15 +173,17 @@ def _ensure_aider(sbx: Sandbox) -> str:
 def _write_file(sbx: Sandbox, rel_path: str, content: str) -> None:
     """Write *content* to /repo/<rel_path>, creating parent directories as needed.
 
-    Content is passed via an environment variable so that quotes, backslashes,
-    and multi-line strings in the test file don't require any escaping.
+    Content is base64-encoded on the host and decoded in the sandbox so that
+    quotes, backslashes, and multi-line strings never need escaping in the
+    generated code string.
     """
+    import base64
+    encoded = base64.b64encode(content.encode()).decode()
     sbx.run_code(
-        "import os, pathlib\n"
+        "import base64, pathlib\n"
         f"p = pathlib.Path('/repo/{rel_path}')\n"
         "p.parent.mkdir(parents=True, exist_ok=True)\n"
-        "p.write_text(os.environ['_FILE_CONTENT'])\n",
-        environment={"_FILE_CONTENT": content},
+        f"p.write_bytes(base64.b64decode({encoded!r}))\n"
     )
 
 
